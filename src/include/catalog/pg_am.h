@@ -61,6 +61,9 @@ MAKE_SYSCACHE(AMOID, pg_am_oid_index, 4);
 #define AMTYPE_INDEX					'i' /* index access method */
 #define AMTYPE_TABLE					't' /* table access method */
 
+/* OID for the blockchain access method handler */
+#define BLOCKCHAINAM_OID 7800 /* TODO: Choose a proper OID */
+
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 
 #endif							/* PG_AM_H */

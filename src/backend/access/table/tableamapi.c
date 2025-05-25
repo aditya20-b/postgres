@@ -11,31 +11,107 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"      // For GetHeapamTableAmRoutine, HeapAmOid
+#include "access/blockchainam.h" // For GetBlockchainAmTableAmRoutine
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_am.h"      // For BLOCKCHAINAM_OID
 #include "commands/defrem.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"     // For strcmp
 #include "utils/guc_hooks.h"
+#include "utils/lsyscache.h"    // For get_am_oid
+#include "nodes/pg_list.h"      // For List
 
 
 /*
+ * TableAmInfo - One-stop shopping for information about a table AM.
+ */
+typedef struct TableAmInfo
+{
+	Oid			amoid;			/* OID of the access method itself */
+	const char *amname;			/* Name of the access method */
+	Oid			amhandler;		/* OID of the handler function (in pg_proc) */
+	const TableAmRoutine *(*handler_hook) (void);	/* Hook to get the routine struct */
+} TableAmInfo;
+
+/*
+ * Built-in table access methods.
+ * This array is searched by GetTableAmRoutineByAmOidAndName().
+ *
+ * Note: amhandler should ideally be a real OID from pg_proc_d.h.
+ * For "blockchain", we'll use InvalidOid placeholder and rely on handler_hook.
+ */
+static const TableAmInfo table_am_handlers[] = {
+	{HeapAmOid, HEAP_TABLE_AM_NAME, HEAP_TABLE_AM_HANDLER_OID, GetHeapamTableAmRoutine},
+	{BLOCKCHAINAM_OID, "blockchain", InvalidOid /* TODO: Define BlockchainTableAmHandlerOid */, GetBlockchainAmTableAmRoutine}
+	/* Add new table AMs here. */
+};
+
+/*
+ * GetTableAmRoutineByAmOid has been removed, its logic is merged into GetTableAmRoutine.
+ */
+
+/*
  * GetTableAmRoutine
- *		Call the specified access method handler routine to get its
- *		TableAmRoutine struct, which will be palloc'd in the caller's
- *		memory context.
+ *		Return the TableAmRoutine struct for the given access method OID
+ *		(from pg_am.oid).
+ *
+ * It first attempts to find a built-in AM by its OID in the
+ * table_am_handlers array and use its C hook. If not found, it falls
+ * back to calling the provided OID as a function, assuming it's an
+ * AM handler function OID (this is legacy behavior and should ideally
+ * not be hit for known AMs).
  */
 const TableAmRoutine *
-GetTableAmRoutine(Oid amhandler)
+GetTableAmRoutine(Oid am_oid) /* Parameter is now treated as pg_am.oid */
 {
 	Datum		datum;
-	const TableAmRoutine *routine;
+	const TableAmRoutine *routine = NULL;
 
-	datum = OidFunctionCall0(amhandler);
-	routine = (TableAmRoutine *) DatumGetPointer(datum);
+	/* Try to find a built-in AM by its OID first */
+	for (int i = 0; i < lengthof(table_am_handlers); i++)
+	{
+		if (table_am_handlers[i].amoid == am_oid)
+		{
+			if (table_am_handlers[i].handler_hook)
+			{
+				routine = table_am_handlers[i].handler_hook();
+				/* Found via hook, no need to check amhandler OID */
+			}
+			else if (OidIsValid(table_am_handlers[i].amhandler))
+			{
+				/* This case is for AMs in the array without a direct C hook */
+				elog(LOG, "Table AM OID %u found in internal handlers, using OidFunctionCall on its amhandler OID %u",
+					 am_oid, table_am_handlers[i].amhandler);
+				datum = OidFunctionCall0(table_am_handlers[i].amhandler);
+				routine = (TableAmRoutine *) DatumGetPointer(datum);
+			}
+			else
+			{
+				/* This case should ideally not be reached for built-ins */
+				elog(ERROR, "no handler_hook or amhandler OID for table access method OID %u in table_am_handlers", am_oid);
+			}
+			break; /* Found in array, exit loop */
+		}
+	}
+
+	if (routine == NULL)
+	{
+		/*
+		 * Not found in table_am_handlers. Fall back to treating the input OID
+		 * as a direct handler function OID. This supports dynamically loaded
+		 * AMs or cases where table_am_handlers might not be exhaustive.
+		 */
+		elog(WARNING, "Table AM OID %u not found in table_am_handlers. Falling back to OidFunctionCall0, assuming it is a handler function OID.",
+			 am_oid);
+		datum = OidFunctionCall0(am_oid);
+		routine = (TableAmRoutine *) DatumGetPointer(datum);
+	}
 
 	if (routine == NULL || !IsA(routine, TableAmRoutine))
-		elog(ERROR, "table access method handler %u did not return a TableAmRoutine struct",
-			 amhandler);
+		elog(ERROR, "table access method OID/handler %u did not return a valid TableAmRoutine struct",
+			 am_oid);
 
 	/*
 	 * Assert that all required callbacks are present. That makes it a bit

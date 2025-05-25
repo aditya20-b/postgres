@@ -1,5 +1,6 @@
 # Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
+subdir('blockchain') # Added for blockchain AM
 subdir('brin')
 subdir('common')
 subdir('gin')
