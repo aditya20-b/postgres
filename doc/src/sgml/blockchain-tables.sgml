@@ -1,0 +1,163 @@
+<!--
+Rough initial documentation for Blockchain Tables.
+This will need to be properly formatted and integrated into the PostgreSQL
+documentation structure by a human developer.
+-->
+
+<chapter id="blockchain-tables">
+ <title>Blockchain Tables</title>
+
+ <sect1 id="blockchain-tables-intro">
+  <title>Introduction</title>
+  <para>
+   Blockchain tables in PostgreSQL provide an append-only, immutable ledger-like
+   functionality. They are designed for scenarios where data, once written,
+   should not be altered or deleted, creating a verifiable history of events
+   or transactions. This can be useful for audit trails, tracking historical
+   changes, or any application requiring a high degree of data integrity and
+   tamper-resistance at the database level.
+  </para>
+  <para>
+   The core principle is that rows written to a blockchain table cannot be
+   updated or deleted through standard DML commands.
+  </para>
+ </sect1>
+
+ <sect1 id="blockchain-tables-usage">
+  <title>Usage</title>
+
+  <sect2 id="blockchain-tables-creation">
+   <title>Creating Blockchain Tables</title>
+   <para>
+    Blockchain tables are created using the <command>CREATE BLOCKCHAIN TABLE</command>
+    syntax. This implicitly uses the "blockchain" access method.
+   </para>
+   <programlisting>
+CREATE BLOCKCHAIN TABLE user_ledgers (
+    event_id SERIAL PRIMARY KEY,
+    user_id INT,
+    event_payload JSONB,
+    event_timestamp TIMESTAMPTZ DEFAULT now()
+);
+   </programlisting>
+   <para>
+    This command creates a new table named <literal>user_ledgers</literal> that will
+    be managed by the blockchain access method. Standard column definitions,
+    constraints (like PRIMARY KEY, NOT NULL, CHECK), and default values can be used.
+   </para>
+  </sect2>
+
+  <sect2 id="blockchain-tables-insert">
+   <title>Inserting Data</title>
+   <para>
+    Data is inserted into blockchain tables using the standard <command>INSERT</command>
+    command.
+   </para>
+   <programlisting>
+INSERT INTO user_ledgers (user_id, event_payload) VALUES
+    (101, '{"action": "login", "status": "success"}'),
+    (102, '{"action": "profile_update", "field": "email"}');
+   </programlisting>
+   <para>
+    Each successful insert represents a new "block" or entry in the immutable ledger.
+   </para>
+  </sect2>
+
+  <sect2 id="blockchain-tables-query">
+   <title>Querying Data</title>
+   <para>
+    Blockchain tables can be queried using standard <command>SELECT</command> commands,
+    just like regular tables. All standard SQL query capabilities, including
+    joins, filtering, and ordering, are supported.
+   </para>
+   <programlisting>
+SELECT * FROM user_ledgers WHERE user_id = 101 ORDER BY event_timestamp DESC;
+   </programlisting>
+  </sect2>
+
+  <sect2 id="blockchain-tables-immutability">
+   <title>Immutability: Restrictions on UPDATE and DELETE</title>
+   <para>
+    A key feature of blockchain tables is their immutability. Standard
+    <command>UPDATE</command> and <command>DELETE</command> operations are
+    not permitted on blockchain tables.
+   </para>
+   <programlisting>
+-- These commands will fail:
+UPDATE user_ledgers SET status = 'revoked' WHERE event_id = 1;
+DELETE FROM user_ledgers WHERE user_id = 102;
+   </programlisting>
+   <para>
+    Attempting such operations will result in an error, enforcing the
+    append-only nature of the table.
+   </para>
+  </sect2>
+
+  <sect2 id="blockchain-tables-indexing">
+   <title>Indexes</title>
+   <para>
+    Indexes (e.g., B-tree, GIN) can be created on blockchain tables to improve
+    query performance, just like with regular tables.
+   </para>
+   <programlisting>
+CREATE INDEX idx_user_ledgers_user_id ON user_ledgers (user_id);
+CREATE INDEX idx_user_ledgers_payload_gin ON user_ledgers USING gin (event_payload);
+   </programlisting>
+  </sect2>
+
+ </sect1>
+
+ <sect1 id="blockchain-tables-limitations">
+  <title>Current Limitations and Future Work</title>
+  <para>
+   This is an initial implementation of blockchain tables. Current limitations
+   and areas for future development include:
+  </para>
+  <itemizedlist>
+    <listitem>
+      <para>
+        **Cryptographic Verification**: The current implementation enforces
+        immutability at the SQL command level (preventing UPDATE/DELETE).
+        Future work may involve adding cryptographic hashing of rows or blocks
+        and linking them to provide stronger, verifiable tamper-evidence.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+        **TRUNCATE**: <command>TRUNCATE</command> behavior on blockchain tables
+        needs to be defined and potentially restricted.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+        **ALTER TABLE**: Most <command>ALTER TABLE</command> operations that
+        would modify existing row data or fundamental structure might be
+        restricted. Adding new columns with default values or adding certain
+        types of constraints might be permissible. This needs further refinement.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+        **MERGE Command**: The interaction of the <command>MERGE</command> command
+        with blockchain tables, particularly its UPDATE and DELETE actions, needs
+        to be fully specified and restricted to maintain immutability.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+        **Performance**: Performance characteristics, especially for very large
+        append-only tables, will require ongoing analysis and optimization.
+      </para>
+    </listitem>
+    <listitem>
+      <para>
+        **Specialized AM Callbacks**: Many of the `TableAmRoutine` callbacks are
+        currently basic implementations or stubs. Further development would
+        involve tailoring these more specifically for blockchain table properties
+        (e.g., `vacuum` could perform integrity checks).
+      </para>
+    </listitem>
+  </itemizedlist>
+ </sect1>
+
+</chapter>

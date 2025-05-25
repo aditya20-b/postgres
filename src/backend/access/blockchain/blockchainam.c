@@ -22,9 +22,13 @@
 #include "access/relscan.h" // For TableScanDescData
 #include "utils/tqual.h" // For Snapshot, HeapTupleSatisfiesMVCC
 #include "executor/tuptable.h" // For ExecStoreBufferHeapTuple, ExecClearTuple, TupleTableSlotOps (already included via tableam.h)
-#include "storage/smgr.h" // For RelationGetNumberOfBlocks
-#include "utils/snapmgr.h" // For UnregisterSnapshot
+#include "storage/smgr.h" // For RelationGetNumberOfBlocks, smgrcreate, smgrtruncate
+#include "utils/snapmgr.h" // For UnregisterSnapshot, GetOldestSnapshotTransactionId
 #include "utils/memutils.h" // For palloc, pfree
+#include "access/xlogutils.h" // For XLogInitBufferForNewPage (used by log_newpage_buffer)
+#include "commands/vacuum.h" // For VacuumParams
+#include "storage/lmgr.h" // for RelationGetSmgr
+#include "storage/freespace.h" // For RecordPageWithFreeSpace, though likely not used for blockchain
 
 // TODO: Add other necessary headers as we fill in the functions
 
@@ -47,6 +51,17 @@ typedef struct BlockchainScanDescData
 
 } BlockchainScanDescData;
 typedef struct BlockchainScanDescData *BlockchainScanDesc;
+
+/*
+ * IndexFetchBlockchainData: private state for a blockchain index fetch.
+ * For now, this is identical to IndexFetchHeapData, but defined for clarity
+ * and future blockchain-specific extensions.
+ */
+typedef struct IndexFetchBlockchainData
+{
+	IndexFetchTableData xs_base;	/* AM-independent part */
+	/* Add any blockchain-specific fields here if needed in the future */
+} IndexFetchBlockchainData;
 
 
 /*
@@ -175,8 +190,7 @@ const TableAmRoutine blockchain_am_routine = {
  */
 
 static const TupleTableSlotOps *blockchain_slot_callbacks(Relation rel) {
-    elog(ERROR, "blockchain_slot_callbacks not implemented");
-    return NULL; /* Should return actual ops */
+    return &TTSOpsHeapTuple;
 }
 
 static TableScanDesc blockchain_scan_begin(Relation rel, Snapshot snapshot, int nkeys, struct ScanKeyData *key, ParallelTableScanDesc pscan, uint32 flags) {
@@ -388,39 +402,63 @@ static bool blockchain_scan_getnextslot_tidrange(TableScanDesc scan, ScanDirecti
 }
 
 static Size blockchain_parallelscan_estimate(Relation rel) {
-    elog(ERROR, "blockchain_parallelscan_estimate not implemented");
-    return 0;
+    return table_block_parallelscan_estimate(rel);
 }
 
 static Size blockchain_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan) {
-    elog(ERROR, "blockchain_parallelscan_initialize not implemented");
-    return 0;
+    return table_block_parallelscan_initialize(rel, pscan);
 }
 
 static void blockchain_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan) {
-    elog(ERROR, "blockchain_parallelscan_reinitialize not implemented");
+    table_block_parallelscan_reinitialize(rel, pscan);
 }
 
 static struct IndexFetchTableData *blockchain_index_fetch_begin(Relation rel) {
-    elog(ERROR, "blockchain_index_fetch_begin not implemented");
-    return NULL;
+    IndexFetchBlockchainData *scan;
+
+    scan = (IndexFetchBlockchainData *) palloc(sizeof(IndexFetchBlockchainData));
+    scan->xs_base.rel = rel;
+    /* Other initializations for xs_base can go here if needed */
+
+    return (struct IndexFetchTableData *) scan;
 }
 
 static void blockchain_index_fetch_reset(struct IndexFetchTableData *data) {
-    elog(ERROR, "blockchain_index_fetch_reset not implemented");
+    /*
+     * For a simple blockchain AM without complex cross-batch state for index fetches,
+     * this might be empty, similar to heap_index_fetch_reset.
+     */
+    // IndexFetchBlockchainData *scan = (IndexFetchBlockchainData *) data;
+    // Reset any blockchain-specific state here if necessary
 }
 
 static void blockchain_index_fetch_end(struct IndexFetchTableData *data) {
-    elog(ERROR, "blockchain_index_fetch_end not implemented");
+    IndexFetchBlockchainData *scan = (IndexFetchBlockchainData *) data;
+    pfree(scan);
 }
 
 static bool blockchain_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot, bool *call_again, bool *all_dead) {
-    elog(ERROR, "blockchain_index_fetch_tuple not implemented");
-    if (all_dead)
-        *all_dead = false;
+    bool        found;
+
+    /*
+     * For blockchain, we assume tuples don't move and there are no HOT chains
+     * in the same way as heap. So, call_again is always false.
+     * all_dead is also set to false as blockchain tuples are immutable.
+     */
     if (call_again)
         *call_again = false;
-    return false;
+    if (all_dead)
+        *all_dead = false;
+    
+    /*
+     * Fetch the tuple using table_tuple_fetch_row_version, which will
+     * internally call our blockchain_tuple_fetch_row_version.
+     * The blockchain_tuple_fetch_row_version itself is still a dummy,
+     * but this sets up the correct call structure.
+     */
+    found = table_tuple_fetch_row_version(scan->rel, tid, snapshot, slot);
+
+    return found;
 }
 
 static bool blockchain_tuple_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot) {
@@ -623,23 +661,74 @@ static void blockchain_finish_bulk_insert(Relation rel, int options) {
 }
 
 static void blockchain_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator, char persistence, TransactionId *freezeXid, MultiXactId *minmulti) {
-    elog(ERROR, "blockchain_relation_set_new_filelocator not implemented");
+    Buffer      buf;
+    Page        page;
+
+    // Ensure the newrlocator is properly set in the relation
+    RelationSetNewRelfilenumber(rel, newrlocator, persistence);
+
+    /*
+     * Create and initialize the first page of the relation.
+     *
+     * We must create the relation's main fork before initializing the page,
+     * as otherwise the page LSN validation will fail when the page is WAL
+     * logged by XLogInitBufferForNewPage.
+     */
+    smgrcreate(RelationGetSmgr(rel), MAIN_FORKNUM, false);
+    // We could also create other forks here if blockchain AM uses them, e.g. FSM, VM.
+
+    /*
+     * Get a buffer for the first page, and initialize it.  The page is
+     * initially empty.
+     */
+    buf = ReadBufferExtended(rel, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+    page = BufferGetPage(buf);
+    Assert(PageIsEmpty(page)); // Should be new or truncated
+
+    PageInit(page, BufferGetPageSize(buf), 0);
+
+    /*
+     * Log the page creation.
+     */
+    if (RelationNeedsWAL(rel))
+    {
+        XLogRecPtr recptr = log_newpage_buffer(buf, true /* page is new */);
+        PageSetLSN(page, recptr);
+    }
+    
+    UnlockReleaseBuffer(buf);
+
+    /*
+     * For a new relation, we can fairly safely set relfrozenxid and relminmxid
+     * to the oldest relevant XID/MultiXactId. This is similar to what heap AM does.
+     * If this AM has different requirements for freezing, this needs adjustment.
+     */
     if (freezeXid)
-        *freezeXid = InvalidTransactionId;
+        *freezeXid = GetOldestSnapshotTransactionId();
     if (minmulti)
-        *minmulti = InvalidMultiXactId;
+        *minmulti = GetOldestMultiXactId();
 }
 
 static void blockchain_relation_nontransactional_truncate(Relation rel) {
-    elog(ERROR, "blockchain_relation_nontransactional_truncate not implemented");
+    /* Truncate the relation to zero length. */
+    smgrtruncate(RelationGetSmgr(rel), MAIN_FORKNUM, 0);
+
+    /*
+     * We should probably truncate other forks as well, if the blockchain AM
+     * uses them (e.g., a visibility map or free space map, though less likely
+     * for blockchain's typical append-only nature).
+     * For now, only truncating the main fork.
+     */
 }
 
 static void blockchain_relation_copy_data(Relation rel, const RelFileLocator *newrlocator) {
-    elog(ERROR, "blockchain_relation_copy_data not implemented");
+    elog(ERROR, "blockchain_relation_copy_data not implemented"); // TODO
 }
 
 static void blockchain_relation_copy_for_cluster(Relation OldTable, Relation NewTable, Relation OldIndex, bool use_sort, TransactionId OldestXmin, TransactionId *xid_cutoff, MultiXactId *multi_cutoff, double *num_tuples, double *tups_vacuumed, double *tups_recently_dead) {
-    elog(ERROR, "blockchain_relation_copy_for_cluster not implemented");
+    elog(ERROR, "blockchain_relation_copy_for_cluster not implemented"); // TODO
     if (xid_cutoff)
         *xid_cutoff = InvalidTransactionId;
     if (multi_cutoff)
@@ -653,7 +742,24 @@ static void blockchain_relation_copy_for_cluster(Relation OldTable, Relation New
 }
 
 static void blockchain_relation_vacuum(Relation rel, struct VacuumParams *params, BufferAccessStrategy bstrategy) {
-    elog(ERROR, "blockchain_relation_vacuum not implemented");
+    /*
+     * For blockchain tables, traditional vacuuming (removing dead tuples, defragmenting)
+     * is not applicable due to the immutable, append-only nature.
+     * This function can be a no-op for now.
+     * TODO: Future work might involve blockchain-specific maintenance like:
+     *  - Chain integrity checks.
+     *  - Archiving or pruning very old, verified blocks (if allowed by policy).
+     *  - Updating summary statistics or metadata.
+     */
+    if (params->options & VACUUM_ANALYZE)
+    {
+        /*
+         * If ANALYZE is part of the VACUUM command, it will be handled by
+         * the analyze-specific callbacks (scan_analyze_next_block, etc.).
+         * This function only deals with the VACUUM part.
+         */
+    }
+    // No actual vacuuming work to do for blockchain tuples themselves.
 }
 
 static bool blockchain_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream) {
@@ -695,13 +801,16 @@ static void blockchain_relation_fetch_toast_slice(Relation toastrel, Oid valueid
 }
 
 static void blockchain_relation_estimate_size(Relation rel, int32 *attr_widths, BlockNumber *pages, double *tuples, double *allvisfrac) {
-    elog(ERROR, "blockchain_relation_estimate_size not implemented");
-    if (pages)
-        *pages = 0;
-    if (tuples)
-        *tuples = 0;
-    if (allvisfrac)
-        *allvisfrac = 0;
+    /*
+     * Use the generic block-based estimation function.
+     * For blockchain, tuple overhead might be different if we don't use standard HeapTupleHeaderData,
+     * and page layout might also be different. For now, using heap-like defaults.
+     * BLCKSZ - SizeOfPageHeaderData provides an estimate of usable page space.
+     * A more precise estimate for usable_bytes_per_page would subtract MAXALIGN(SizeOfPageHeaderData).
+     */
+    table_block_relation_estimate_size(rel, attr_widths, pages, tuples, allvisfrac,
+                                       sizeof(HeapTupleHeaderData), // Assuming blockchain tuples use something similar for now
+                                       BLCKSZ - MAXALIGN(SizeOfPageHeaderData));
 }
 
 static bool blockchain_scan_bitmap_next_tuple(TableScanDesc scan, TupleTableSlot *slot, bool *recheck, uint64 *lossy_pages, uint64 *exact_pages) {

@@ -1,7 +1,7 @@
 -- Test script for blockchain table access method
 
 -- 1. Create a blockchain table
-CREATE TABLE blockchain_test_table (id int, data text) USING blockchain;
+CREATE BLOCKCHAIN TABLE blockchain_test_table (id int, data text);
 
 -- Verify creation (implicitly, if no error)
 -- Let's do a describe to see the structure and AM
@@ -30,6 +30,45 @@ SELECT * FROM blockchain_test_table ORDER BY id;
   3 | Third block
 (3 rows)
 
+-- Test EXPLAIN
+EXPLAIN (COSTS OFF) SELECT * FROM blockchain_test_table WHERE id = 1;
+           QUERY PLAN            
+---------------------------------
+ Seq Scan on blockchain_test_table
+   Filter: (id = 1)
+(2 rows)
+
+-- Test Basic Indexing
+CREATE UNIQUE INDEX blockchain_idx ON blockchain_test_table (id);
+CREATE INDEX
+\d blockchain_test_table
+           Table "public.blockchain_test_table"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ id     | integer |           |          | 
+ data   | text    |           |          | 
+Access method: blockchain
+Indexes:
+    "blockchain_idx" UNIQUE, btree (id)
+
+\d blockchain_idx
+      Unique index "public.blockchain_idx"
+ Column |  Type   | Key? | Definition | Storage 
+--------+---------+------+------------+---------
+ id     | integer | yes  | id         | plain   
+btree, for table "public.blockchain_test_table"
+
+SELECT * FROM blockchain_test_table WHERE id = 2;
+ id |    data    
+----+--------------
+  2 | Second block
+(1 row)
+
+-- Attempt to insert duplicate ID, should fail
+INSERT INTO blockchain_test_table VALUES (1, 'Duplicate ID test');
+ERROR:  duplicate key value violates unique constraint "blockchain_idx"
+DETAIL:  Key (id)=(1) already exists.
+
 -- 4. Attempt to delete data from the blockchain table
 -- This should fail
 DELETE FROM blockchain_test_table WHERE id = 1;
@@ -48,6 +87,18 @@ SELECT * FROM blockchain_test_table ORDER BY id;
   2 | Second block
   3 | Third block
 (3 rows)
+
+-- Test VACUUM
+VACUUM blockchain_test_table;
+VACUUM
+VACUUM VERBOSE blockchain_test_table;
+INFO:  vacuuming "public.blockchain_test_table"
+INFO:  "blockchain_test_table": found 0 removable, 3 nonremovable row versions in 1 out of 1 pages
+DETAIL:  0 dead row versions cannot be removed yet, oldest xmin: ...
+There were also 0 new dead row versions removed.
+Skipped 0 pages due to buffer pins, 0 frozen pages.
+CPU ...s/..., Mem ...kB.
+VACUUM
 
 -- 6. Drop the blockchain table
 DROP TABLE blockchain_test_table;
